@@ -172,6 +172,19 @@
         )) {
             return null;
         }
+        // Fix: Block invalid :contains pseudo-selectors
+        if (typeof selector === 'string' && selector.includes(':contains')) {
+            // Example: button:contains("Next")
+            // Extract tag and text
+            const match = selector.match(/(\w+):contains\(["'](.+)["']\)/);
+            if (match) {
+                const tag = match[1];
+                const text = match[2];
+                return [...document.querySelectorAll(tag)].find(el => el.textContent && el.textContent.includes(text));
+            }
+            // If not matched, return null
+            return null;
+        }
         return originalQuerySelector.call(this, selector);
     };
     
@@ -185,6 +198,19 @@
             selector.includes('alert') ||
             selector.includes('warning')
         )) {
+            return [];
+        }
+        // Fix: Block invalid :contains pseudo-selectors
+        if (typeof selector === 'string' && selector.includes(':contains')) {
+            // Example: button:contains("Next")
+            // Extract tag and text
+            const match = selector.match(/(\w+):contains\(["'](.+)["']\)/);
+            if (match) {
+                const tag = match[1];
+                const text = match[2];
+                return [...document.querySelectorAll(tag)].filter(el => el.textContent && el.textContent.includes(text));
+            }
+            // If not matched, return []
             return [];
         }
         return originalQuerySelectorAll.call(this, selector);

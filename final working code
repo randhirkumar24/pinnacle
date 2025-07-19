@@ -1,0 +1,388 @@
+// ==UserScript==
+// @name         Pinnacle Ebooks PDF Capture (Virtualization Safe)
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Scroll through the virtualized Pinnacle viewer, capture each page canvas, and export a full PDF.
+// @match        *://ebooks.ssccglpinnacle.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+  
+    /********************************************************************
+     * CONFIG
+     ********************************************************************/
+    const SCROLLER_SELECTOR    = '[data-testid="core__inner-pages"]'; // inner viewer (your screenshot)
+    const PAGE_WRAPPER_SEL     = '[data-testid^="core__page-layer-"], [data-testid^="core_text-layer-"], .rpv-core__page-layer';
+    const CANVAS_WITHIN_PAGE   = 'canvas';
+  
+    // Scrolling / rendering
+    const RENDER_WAIT_MS       = 400;   // wait after each scroll for new pages to mount (increase to 800+ if slow)
+    const EXTRA_SETTLE_MS      = 150;   // tiny settle at bottom
+    const STEP_FRACTION        = 0.80;  // move by 80% of viewport each scroll step
+    const MAX_PAGES_SAFETY     = 1000;  // hard stop
+    const MAX_SCROLL_STEPS     = 5000;  // loop safety
+  
+    // Fallback capture if no <canvas> found in wrapper
+    const USE_HTML2CANVAS_FALLBACK = true;
+    const H2C_URL              = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+  
+    // PDF options
+    // MODE: 'A4' | 'LETTER' | 'FIT_TO_IMAGE'  (fit = page size per image)
+    const PDF_PAGE_MODE        = 'A4';
+    // ORIENTATION: 'auto' | 'portrait' | 'landscape'
+    const PDF_ORIENTATION      = 'auto';
+    const PDF_MARGIN_PT        = 10;    // inner margin when scaling to page size
+  
+    // UI button
+    const BUTTON_ID            = 'pinnaclePdfCaptureBtn';
+    const BUTTON_STYLE = `
+      position:fixed;top:100px;right:20px;z-index:999999;
+      padding:10px 16px;background:#27ae60;color:#fff;border:none;
+      border-radius:5px;font-size:15px;font-family:sans-serif;
+      cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,.25);font-weight:bold;
+    `;
+  
+    // jsPDF CDN
+    const JSPDF_URL            = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+  
+  
+    /********************************************************************
+     * UTIL
+     ********************************************************************/
+    const sleep = ms => new Promise(r=>setTimeout(r,ms));
+  
+    function waitForEl(selector, timeoutMs=20000, pollMs=200){
+      return new Promise((resolve, reject)=>{
+        const start = performance.now();
+        (function poll(){
+          const el = document.querySelector(selector);
+          if (el) return resolve(el);
+          if (performance.now() - start > timeoutMs) return reject(new Error('Timeout waiting for '+selector));
+          setTimeout(poll, pollMs);
+        })();
+      });
+    }
+  
+    function injectButton(onClick){
+      let btn = document.getElementById(BUTTON_ID);
+      if (btn) return btn;
+      btn = document.createElement('button');
+      btn.id = BUTTON_ID;
+      btn.textContent = 'Capture Full PDF';
+      btn.style.cssText = BUTTON_STYLE;
+      btn.addEventListener('mouseover',()=>{ if(!btn.disabled) btn.style.background='#229954';});
+      btn.addEventListener('mouseout',()=>{ if(!btn.disabled) btn.style.background='#27ae60';});
+      btn.addEventListener('click',onClick);
+      document.body.appendChild(btn);
+      return btn;
+    }
+  
+    function setButton(btn, text, disabled, bg){
+      if (text != null) btn.textContent = text;
+      if (disabled != null) btn.disabled = disabled;
+      if (bg != null) btn.style.background = bg;
+    }
+  
+  
+    /********************************************************************
+     * HUD
+     ********************************************************************/
+    let hudDiv = null;
+    function hud(msg){
+      if (!hudDiv) {
+        hudDiv = document.createElement('div');
+        hudDiv.style.cssText = `
+          position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+          background:rgba(0,0,0,.8);color:#fff;padding:20px;border-radius:10px;
+          z-index:999999;font-size:16px;font-family:sans-serif;text-align:center;
+          max-width:320px;white-space:pre-line;
+        `;
+        document.body.appendChild(hudDiv);
+      }
+      hudDiv.textContent = msg;
+    }
+    function hudRemove(){
+      if (hudDiv) { hudDiv.remove(); hudDiv = null; }
+    }
+  
+  
+    /********************************************************************
+     * LIB LOADER
+     ********************************************************************/
+    async function ensureLibraries(){
+      const loads = [];
+      if (!window.jspdf || !window.jspdf.jsPDF) {
+        loads.push(new Promise((res,rej)=>{
+          const s = document.createElement('script');
+          s.src = JSPDF_URL;
+          s.onload = res;
+          s.onerror = ()=>rej(new Error('Failed to load jsPDF'));
+          document.body.appendChild(s);
+        }));
+      }
+      if (USE_HTML2CANVAS_FALLBACK && !window.html2canvas) {
+        loads.push(new Promise((res,rej)=>{
+          const s = document.createElement('script');
+          s.src = H2C_URL;
+          s.onload = res;
+          s.onerror = ()=>rej(new Error('Failed to load html2canvas'));
+          document.body.appendChild(s);
+        }));
+      }
+      if (loads.length) await Promise.all(loads);
+    }
+  
+  
+    /********************************************************************
+     * PAGE DETECTION & CAPTURE
+     ********************************************************************/
+    // extract numeric page index from wrapper attrs
+    function parsePageIndexFromEl(el){
+      const attrs = ['data-testid','data-page','id','class'];
+      for (const a of attrs){
+        const v = el.getAttribute && el.getAttribute(a);
+        if (!v) continue;
+        // core__page-layer-0, core_text-layer-7, page-3, etc.
+        const m = v.match(/(?:page|layer|text)[-_]?(\d+)/i);
+        if (m) return parseInt(m[1],10);
+      }
+      return null;
+    }
+  
+    // capture wrapper: prefer <canvas>; fallback html2canvas
+    async function capturePageWrapper(el){
+      const cvs = el.querySelectorAll(CANVAS_WITHIN_PAGE);
+      if (cvs.length) {
+        // pick largest
+        let best = cvs[0], bestArea = best.width * best.height;
+        for (const c of cvs) {
+          const a = c.width * c.height;
+          if (a > bestArea) { best = c; bestArea = a; }
+        }
+        const clone = document.createElement('canvas');
+        clone.width = best.width;
+        clone.height = best.height;
+        clone.getContext('2d', {willReadFrequently:true}).drawImage(best,0,0);
+        return clone;
+      }
+  
+      if (USE_HTML2CANVAS_FALLBACK && window.html2canvas) {
+        const rect = el.getBoundingClientRect();
+        const canvas = await html2canvas(el, {
+          backgroundColor:null,
+          useCORS:true,
+          scale:2,
+          scrollX:0,
+          scrollY:0,
+          width:rect.width,
+          height:rect.height,
+          windowWidth:rect.width,
+          windowHeight:rect.height,
+          logging:false
+        });
+        return canvas;
+      }
+  
+      return null;
+    }
+  
+  
+    /********************************************************************
+     * PDF HELPERS
+     ********************************************************************/
+    const PAGE_SIZES_PT = {
+      A4:     {w:595.28, h:841.89},
+      LETTER: {w:612,    h:792}
+    };
+  
+    function chooseOrientation(imgW, imgH){
+      if (PDF_ORIENTATION !== 'auto') return PDF_ORIENTATION;
+      return imgW >= imgH ? 'landscape' : 'portrait';
+    }
+  
+    function getPageDims(mode, orient){
+      const base = PAGE_SIZES_PT[mode] || PAGE_SIZES_PT.A4;
+      return (orient === 'landscape') ? {w:base.h, h:base.w} : {w:base.w, h:base.h};
+    }
+  
+    function addCanvasToPdf(pdf, canvas, pageIdx, mode){
+      const imgWpx = canvas.width;
+      const imgHpx = canvas.height;
+      const orient = chooseOrientation(imgWpx, imgHpx);
+  
+      let pageWpt, pageHpt;
+      if (mode === 'FIT_TO_IMAGE') {
+        const PX_TO_PT = 0.75; // approx 96dpi -> 72pt
+        pageWpt = imgWpx * PX_TO_PT + PDF_MARGIN_PT*2;
+        pageHpt = imgHpx * PX_TO_PT + PDF_MARGIN_PT*2;
+      } else {
+        const dims = getPageDims(mode, orient);
+        pageWpt = dims.w;
+        pageHpt = dims.h;
+      }
+  
+      if (pageIdx > 0) pdf.addPage([pageWpt, pageHpt], orient);
+  
+      const slotW = pageWpt - PDF_MARGIN_PT*2;
+      const slotH = pageHpt - PDF_MARGIN_PT*2;
+      const imgAspect = imgWpx / imgHpx;
+      const slotAspect = slotW / slotH;
+      let drawW = slotW, drawH = slotH;
+      if (imgAspect > slotAspect) {
+        drawH = slotW / imgAspect;
+      } else {
+        drawW = slotH * imgAspect;
+      }
+      const x = (pageWpt - drawW)/2;
+      const y = (pageHpt - drawH)/2;
+      const dataURL = canvas.toDataURL('image/png');
+      pdf.addImage(dataURL, 'PNG', x, y, drawW, drawH);
+    }
+  
+  
+    /********************************************************************
+     * MAIN CAPTURE FLOW
+     ********************************************************************/
+    async function runCapture(){
+      const btn = document.getElementById(BUTTON_ID);
+      setButton(btn, 'Capturing...', true, '#95a5a6');
+      hud('Preparing...');
+  
+      try {
+        const scroller = await waitForEl(SCROLLER_SELECTOR, 20000);
+        await ensureLibraries();
+        const { jsPDF } = window.jspdf;
+  
+        // start from top
+        scroller.scrollTop = 0;
+        await sleep(RENDER_WAIT_MS);
+  
+        const capturedMap = new Map(); // key -> canvas
+        const captureOrder = [];       // track sequence for fallback sort
+        let fallbackCounter = 0;
+  
+        // Determine step
+        const viewportH = scroller.clientHeight || 1;
+        const step = Math.max(1, Math.round(viewportH * STEP_FRACTION));
+        const maxScroll = scroller.scrollHeight - viewportH;
+        let pos = 0;
+        let iterations = 0;
+  
+        async function scanAndCapture(){
+          const wrappers = Array.from(scroller.querySelectorAll(PAGE_WRAPPER_SEL));
+          if (!wrappers.length) return;
+          // stable order top->bottom
+          wrappers.sort((a,b)=>a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+          for (const w of wrappers) {
+            const idx = parsePageIndexFromEl(w);
+            const key = (idx != null) ? idx : ('f'+(fallbackCounter++));
+            if (capturedMap.has(key)) continue;
+            hud('Capturing page ' + (idx!=null?idx+1:capturedMap.size+1) + '...');
+            const c = await capturePageWrapper(w);
+            if (c) {
+              capturedMap.set(key, c);
+              captureOrder.push(key);
+              console.log('[PDF CAP] Captured page key:', key, 'size:', c.width+'x'+c.height);
+              if (capturedMap.size >= MAX_PAGES_SAFETY) return; // stop if insane
+            } else {
+              console.warn('[PDF CAP] Failed to capture wrapper', w);
+            }
+          }
+        }
+  
+        // initial scan
+        await scanAndCapture();
+  
+        // progressive scroll loop
+        while (pos < maxScroll && iterations < MAX_SCROLL_STEPS && capturedMap.size < MAX_PAGES_SAFETY) {
+          pos += step;
+          if (pos > maxScroll) pos = maxScroll;
+          scroller.scrollTop = pos;
+          await sleep(RENDER_WAIT_MS);
+          await scanAndCapture();
+          iterations++;
+        }
+  
+        // final bottom settle scan
+        scroller.scrollTop = maxScroll;
+        await sleep(EXTRA_SETTLE_MS);
+        await scanAndCapture();
+  
+        const totalCaptured = capturedMap.size;
+        console.log('[PDF CAP] Total pages captured:', totalCaptured);
+  
+        if (!totalCaptured) {
+          hudRemove();
+          alert('No pages captured.');
+          setButton(btn, 'Capture Full PDF', false, '#27ae60');
+          return;
+        }
+  
+        hud('Building PDF...');
+  
+        // sort keys: numerics ascending, then fallback in capture order sequence
+        const numeric = captureOrder.filter(k => Number.isInteger(k)).sort((a,b)=>a-b);
+        const fallback = captureOrder.filter(k => !Number.isInteger(k)); // already in order
+        const orderedKeys = numeric.concat(fallback);
+  
+        const pdf = new jsPDF({orientation:'portrait',unit:'pt',format:'a4'});
+        let first = true;
+        let pageIdx = 0;
+        for (const k of orderedKeys) {
+          const cv = capturedMap.get(k);
+          if (!cv) continue;
+          addCanvasToPdf(pdf, cv, first?0:pageIdx, PDF_PAGE_MODE);
+          first = false;
+          pageIdx++;
+        }
+  
+        // filename
+        const sectionName =
+          document.querySelector('.Sidebar_chapterTitle__mOVtZ.Sidebar_active__2relq')?.innerText ||
+          document.querySelector('.Sidebar_chapterTitle__mOVtZ')?.innerText ||
+          document.querySelector('[class*="chapter"][class*="active"]')?.innerText ||
+          document.querySelector('h1')?.innerText ||
+          document.querySelector('h2')?.innerText ||
+          document.title ||
+          'pinnacle_ebook';
+        const clean = sectionName.replace(/[^\w\s-]/g,'').replace(/\s+/g,'_');
+        const filename = `${clean}_${pageIdx}_pages.pdf`;
+  
+        pdf.save(filename);
+        hudRemove();
+        alert('PDF downloaded: '+filename+' (pages: '+pageIdx+')');
+        setButton(btn, 'Capture Full PDF', false, '#27ae60');
+  
+      } catch (err) {
+        console.error('[PDF CAP] Error:', err);
+        hudRemove();
+        alert('Capture failed: '+err.message);
+        const btn = document.getElementById(BUTTON_ID);
+        if (btn) setButton(btn, 'Capture Full PDF', false, '#27ae60');
+      }
+    }
+  
+  
+    /********************************************************************
+     * INIT
+     ********************************************************************/
+    function init(){
+      injectButton(runCapture);
+    }
+  
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  
+    // reinject safeguard (in case SPA navigation replaces DOM)
+    setInterval(()=>{
+      if (!document.getElementById(BUTTON_ID)) init();
+    }, 5000);
+  
+  })();
+  
